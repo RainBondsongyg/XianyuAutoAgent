@@ -60,7 +60,7 @@ class XianyuApis:
             cookie_str = '; '.join([f"{cookie.name}={cookie.value}" for cookie in self.session.cookies])
             
             # 读取.env文件
-            env_path = os.path.join(os.getcwd(), '.env')
+            env_path = os.path.join(os.getcwd(), 'env/.env')
             if not os.path.exists(env_path):
                 logger.warning(".env文件不存在，无法更新COOKIES_STR")
                 return
