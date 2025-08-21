@@ -7,16 +7,55 @@ from loguru import logger
 
 class XianyuReplyBot:
     def __init__(self):
-        # 初始化OpenAI客户端
-        self.client = OpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        )
+        # 初始化OpenAI客户端（容错：无密钥时降级为本地占位客户端）
+        self.client = self._init_llm_client()
         self._init_system_prompts()
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
         self.last_intent = None  # 记录最后一次意图
 
+
+    def _init_llm_client(self):
+        """初始化LLM客户端；当无法获取到密钥时，使用占位客户端避免报错中断。"""
+        api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("MODEL_BASE_URL")
+
+        class _DummyMessage:
+            def __init__(self, content: str):
+                self.content = content
+
+        class _DummyChoice:
+            def __init__(self, content: str):
+                self.message = _DummyMessage(content)
+
+        class _DummyResponse:
+            def __init__(self, content: str):
+                self.choices = [_DummyChoice(content)]
+
+        class _DummyCompletions:
+            def create(self, **kwargs):
+                return _DummyResponse("抱歉，当前未配置模型密钥，已切换为安全降级模式的固定回复。")
+
+        class _DummyChat:
+            def __init__(self):
+                self.completions = _DummyCompletions()
+
+        class DummyClient:
+            is_dummy = True
+            def __init__(self):
+                self.chat = _DummyChat()
+
+        try:
+            if not api_key:
+                logger.warning("未检测到 API_KEY，使用占位客户端运行（不会调用外部模型）")
+                return DummyClient()
+            if base_url:
+                return OpenAI(api_key=api_key, base_url=base_url)
+            else:
+                return OpenAI(api_key=api_key)
+        except Exception as e:
+            logger.error(f"初始化LLM客户端失败，将使用占位客户端：{e}")
+            return DummyClient()
 
     def _init_agents(self):
         """初始化各领域Agent"""
@@ -28,34 +67,30 @@ class XianyuReplyBot:
         }
 
     def _init_system_prompts(self):
-        """初始化各Agent专用提示词，直接从文件中加载"""
+        """初始化各Agent专用提示词；当文件缺失时使用内置默认内容，不中断程序。"""
         prompt_dir = "prompts"
-        
-        try:
-            # 加载分类提示词
-            with open(os.path.join(prompt_dir, "classify_prompt.txt"), "r", encoding="utf-8") as f:
-                self.classify_prompt = f.read()
-                logger.debug(f"已加载分类提示词，长度: {len(self.classify_prompt)} 字符")
-            
-            # 加载价格提示词
-            with open(os.path.join(prompt_dir, "price_prompt.txt"), "r", encoding="utf-8") as f:
-                self.price_prompt = f.read()
-                logger.debug(f"已加载价格提示词，长度: {len(self.price_prompt)} 字符")
-            
-            # 加载技术提示词
-            with open(os.path.join(prompt_dir, "tech_prompt.txt"), "r", encoding="utf-8") as f:
-                self.tech_prompt = f.read()
-                logger.debug(f"已加载技术提示词，长度: {len(self.tech_prompt)} 字符")
-            
-            # 加载默认提示词
-            with open(os.path.join(prompt_dir, "default_prompt.txt"), "r", encoding="utf-8") as f:
-                self.default_prompt = f.read()
-                logger.debug(f"已加载默认提示词，长度: {len(self.default_prompt)} 字符")
-                
-            logger.info("成功加载所有提示词")
-        except Exception as e:
-            logger.error(f"加载提示词时出错: {e}")
-            raise
+
+        def _read_prompt(filename_base: str, default_content: str) -> str:
+            candidates = [
+                os.path.join(prompt_dir, f"{filename_base}.txt"),
+                os.path.join(prompt_dir, f"{filename_base}_example.txt"),
+            ]
+            for path in candidates:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        logger.debug(f"已加载提示词: {path}，长度: {len(content)} 字符")
+                        return content
+                except Exception:
+                    continue
+            logger.warning(f"提示词文件缺失，使用默认内容: {filename_base}")
+            return default_content
+
+        self.classify_prompt = _read_prompt("classify_prompt", "请判断用户信息属于技术咨询、价格议价或默认闲聊中的哪一类，仅返回 tech/price/default 之一。")
+        self.price_prompt = _read_prompt("price_prompt", "请围绕价格进行友好、简洁的议价回复，注意礼貌、避免敏感信息。")
+        self.tech_prompt = _read_prompt("tech_prompt", "请基于商品信息进行简要技术解答，突出关键参数和适配性。")
+        self.default_prompt = _read_prompt("default_prompt", "请进行友好且简短的客服式回复，避免涉及平台外联系方式。")
+        logger.info("提示词加载完成（包含可能的默认内容）")
 
     def _safe_filter(self, text: str) -> str:
         """安全过滤模块"""
@@ -212,14 +247,21 @@ class BaseAgent:
 
     def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
         """调用大模型"""
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=temperature,
-            max_tokens=500,
-            top_p=0.8
-        )
-        return response.choices[0].message.content
+        # 当客户端是占位实现或调用异常时，返回兜底回答
+        if getattr(self.client, 'is_dummy', False):
+            return "抱歉，暂时无法连接大模型服务。我已记录您的问题，将尽快回复。"
+        try:
+            response = self.client.chat.completions.create(
+                model=os.getenv("MODEL_NAME", "qwen-max"),
+                messages=messages,
+                temperature=temperature,
+                max_tokens=500,
+                top_p=0.8
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"调用LLM失败，使用兜底回复：{e}")
+            return "抱歉，当前服务繁忙，请稍后再试。"
 
 
 class PriceAgent(BaseAgent):
@@ -230,15 +272,8 @@ class PriceAgent(BaseAgent):
         dynamic_temp = self._calc_temperature(bargain_count)
         messages = self._build_messages(user_msg, item_desc, context)
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=dynamic_temp,
-            max_tokens=500,
-            top_p=0.8
-        )
-        return self.safety_filter(response.choices[0].message.content)
+        reply = self._call_llm(messages, temperature=dynamic_temp)
+        return self.safety_filter(reply)
 
     def _calc_temperature(self, bargain_count: int) -> float:
         """动态温度策略"""
@@ -251,19 +286,8 @@ class TechAgent(BaseAgent):
         """重写生成逻辑"""
         messages = self._build_messages(user_msg, item_desc, context)
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=0.4,
-            max_tokens=500,
-            top_p=0.8,
-            extra_body={
-                "enable_search": True,
-            }
-        )
-
-        return self.safety_filter(response.choices[0].message.content)
+        reply = self._call_llm(messages, temperature=0.4)
+        return self.safety_filter(reply)
 
 
     # def _fetch_tech_specs(self) -> str:

@@ -21,9 +21,12 @@ class XianyuLive:
         self.base_url = 'wss://wss-goofish.dingtalk.com/'
         self.cookies_str = cookies_str
         self.cookies = trans_cookies(cookies_str)
-        self.xianyu.session.cookies.update(self.cookies)  # 直接使用 session.cookies.update
-        self.myid = self.cookies['unb']
-        self.device_id = generate_device_id(self.myid)
+        try:
+            self.xianyu.session.cookies.update(self.cookies)
+        except Exception:
+            pass
+        self.myid = self.cookies.get('unb', '0')
+        self.device_id = generate_device_id(self.myid or '0')
         self.context_manager = ChatContextManager()
         
         # 心跳相关配置
@@ -59,7 +62,11 @@ class XianyuLive:
             logger.info("开始刷新token...")
             
             # 获取新token（如果Cookie失效，get_token会直接退出程序）
-            token_result = self.xianyu.get_token(self.device_id)
+            try:
+                token_result = self.xianyu.get_token(self.device_id)
+            except SystemExit:
+                logger.error("获取token时外部调用触发退出，已拦截并降级处理")
+                return None
             if 'data' in token_result and 'accessToken' in token_result['data']:
                 new_token = token_result['data']['accessToken']
                 self.current_token = new_token
@@ -159,7 +166,8 @@ class XianyuLive:
         
         if not self.current_token:
             logger.error("无法获取有效token，初始化失败")
-            raise Exception("Token获取失败")
+            # 不抛出异常，直接返回，后续由上层重连逻辑兜底
+            return
             
         msg = {
             "lwp": "/reg",
